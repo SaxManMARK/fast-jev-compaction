@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.3.1-goengage",
+  "version": "0.3.2-goengage",
   "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
   "license": "MIT",
   "userConfig": {
@@ -26,7 +26,7 @@
       "type": "number",
       "title": "Compaction percentage",
       "description": "Context percentage at which turn.complete requests compaction.",
-      "default": 60
+      "default": 50
     },
     "minReductionRatio": {
       "type": "number",

@@ -20,7 +20,7 @@ import type {
 } from '../src/types.js';
 
 const HOOK_DEFAULTS = {
-  compactAtPercent: 60,
+  compactAtPercent: 50,
   minReductionRatio: 0.25,
   model: DEFAULT_MODEL,
 };
