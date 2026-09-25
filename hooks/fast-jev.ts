@@ -243,17 +243,46 @@ async function getApiKey(
   return undefined;
 }
 
-function notify(
-  $: {
-    ui: {
-      log: (text: string) => void;
-      toast: (text: string, options?: { timeoutMs?: number }) => void;
-    };
-  },
-  text: string,
-): void {
+type NoticeHost = {
+  ui: {
+    log: (text: string) => void;
+    toast: (text: string, options?: { timeoutMs?: number }) => void;
+  };
+  fs: {
+    read: (path: string) => Promise<unknown>;
+    write: (path: string, text: string) => Promise<void>;
+  };
+  env: { get: (name: string) => Promise<string | undefined> };
+  clock: { now: () => Promise<number> };
+};
+
+/**
+ * Appends one line to `~/.claude/fast-jev-compaction.log`. In a headless or SDK session (Claude Code on
+ * the web runs this way) `$.ui.log` and toasts go to the host's debug stream, not the transcript, so
+ * without a file nothing the plugin decided can be checked afterwards. Best effort: never throws.
+ */
+async function record($: NoticeHost, text: string): Promise<void> {
+  try {
+    const home = (await $.env.get('HOME')) ?? '/tmp';
+    const path = `${home}/.claude/fast-jev-compaction.log`;
+    let prior = '';
+    try {
+      const got = await $.fs.read(path);
+      prior = typeof got === 'string' ? got : '';
+    } catch {
+      prior = '';
+    }
+    const line = `${new Date(await $.clock.now()).toISOString()} ${text}\n`;
+    await $.fs.write(path, (prior + line).slice(-200_000));
+  } catch {
+    // the log is a convenience; a failure here must not change what the hook does
+  }
+}
+
+async function notify($: NoticeHost, text: string): Promise<void> {
   $.ui.log(text);
   $.ui.toast(text, { timeoutMs: 15_000 });
+  await record($, text);
 }
 
 export const register: Register = (on: On, options: PluginOptions) => {
@@ -268,20 +297,21 @@ export const register: Register = (on: On, options: PluginOptions) => {
         return { status: response.status, ok: response.ok, text: response.text };
       });
       for (const line of decisionLogLines(result)) $.ui.log(line);
+      await record($, `session.compact (${event.trigger}): ${decisionLogLines(result).length} decisions`);
       if (reductionRatio(result) < config.minReductionRatio) {
-        notify(
+        await notify(
           $,
           `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`,
         );
         return next(event);
       }
-      notify(
+      await notify(
         $,
         `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
       );
       return { messages };
     } catch (error) {
-      notify(
+      await notify(
         $,
         `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
       );
@@ -289,21 +319,39 @@ export const register: Register = (on: On, options: PluginOptions) => {
     }
   });
 
+  // Asks for a compaction once the context passes `compactAtPercent`, AFTER the turn has completed.
+  //
+  // ⛑ Changed 25 September 2026 (goengage fork). The original awaited `$.session.compact()` before
+  // `next(event)`, which never worked in a headless or SDK session, and Claude Code on the web is one:
+  // there the engine refuses `$.session.compact()` from a hook ("not available in a headless (-p / SDK)
+  // session yet: compaction here runs inside a turn (a /compact prompt)"), before or after `next`, and
+  // the refusal went only to `$.ui.log`, which that host does not show. Measured on Claude Code 2.1.281:
+  // `$.command.run({ command: 'compact' })` from here, after `next`, queues a /compact that raises
+  // `session.compact` with trigger `manual`, so this plugin's own hook serves it. The direct call is
+  // still tried first, for the interactive terminal where it works.
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
-    if (compacting) return next(event);
+    const result = await next(event);
+    if (compacting || event.agentId || event.isAborted) return result;
     try {
       const { context } = await $.session.usage();
-      if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
+      if (context.percent === undefined || context.percent < configured.compactAtPercent) return result;
       compacting = true;
-      await $.session.compact();
+      await record($, `turn.complete: context ${context.percent}% >= ${configured.compactAtPercent}%, requesting compaction`);
+      try {
+        await $.session.compact();
+        await record($, 'requested with $.session.compact()');
+      } catch (direct) {
+        const why = direct instanceof Error ? direct.message : String(direct);
+        await record($, `$.session.compact() refused (${why}); queuing /compact instead`);
+        const ran = await $.command.run({ command: 'compact' });
+        await record($, `queued /compact: ${ran?.text ?? 'no text'}`);
+      }
     } catch (error) {
-      $.ui.log(
-        `auto-compact skipped (${error instanceof Error ? error.message : String(error)})`,
-      );
+      await notify($, `auto-compact skipped (${error instanceof Error ? error.message : String(error)})`);
     } finally {
       compacting = false;
     }
-    return next(event);
+    return result;
   });
 };
 
